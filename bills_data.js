@@ -15,10 +15,32 @@ window.addEventListener('DOMContentLoaded', function() {
     '56':'WY','60':'AS','66':'GU','69':'MP','72':'PR','78':'VI'
   };
 
+  function extractDistrictNumber(cdObj) {
+    if (!cdObj) return 'At Large';
+    const dynamicCdKey = Object.keys(cdObj).find(k => /^CD\d+$/i.test(k));
+    let raw = (dynamicCdKey && cdObj[dynamicCdKey]) || cdObj.CD120 || cdObj.CD119 || cdObj.CD118 || cdObj.CD117 || cdObj.CD || cdObj.BASENAME || '';
+    raw = String(raw).trim();
+    if (!raw || raw === '00' || raw === '98' || /at\s*large|delegate|resident/i.test(raw)) return 'At Large';
+    const numMatch = raw.match(/^\d+$/);
+    if (numMatch) {
+      const stripped = raw.replace(/^0+/, '');
+      return stripped || 'At Large';
+    }
+    return raw;
+  }
+
   window.getFilteredLegislators = function() {
     if (!state.data) return [];
     const q = (state.legSearch || '').trim().toLowerCase();
+    const matchedIds = state.addressResult
+      ? new Set([
+          ...(state.addressResult.senators || []).map(s => s.id),
+          ...(state.addressResult.rep ? [state.addressResult.rep.id] : [])
+        ])
+      : null;
+
     return state.data.legislators.filter(l => {
+      if (matchedIds && !matchedIds.has(l.id)) return false;
       if (state.legChamberFilter !== 'ALL' && l.chamber !== state.legChamberFilter) return false;
       if (state.legPartyFilter !== 'ALL' && l.party !== state.legPartyFilter) return false;
       if (state.legStateFilter !== 'ALL' && l.state !== state.legStateFilter) return false;
@@ -56,7 +78,6 @@ window.addEventListener('DOMContentLoaded', function() {
         state.addressLoading = false;
         state.addressError = '';
         state.addressResult = { matchedAddress: `${st} Congressional District ${dist}`, state: st, district: dist, senators, rep: rep || null };
-        state.legStateFilter = st;
         render();
         return;
       }
@@ -98,14 +119,11 @@ window.addEventListener('DOMContentLoaded', function() {
         const cdObj = cdArr && cdArr[0] ? cdArr[0] : null;
         const stFips = (cdObj && cdObj.STATE) || (best.addressComponents && best.addressComponents.state) || '';
         const stCode = FIPS_TO_STATE[stFips] || (best.addressComponents && best.addressComponents.state) || '';
-        let rawCd = cdObj ? (cdObj.CD119 || cdObj.CD118 || cdObj.CD117 || cdObj.CD || '') : '';
-        let dist = rawCd.replace(/^0+/, '');
-        if (!dist || dist === '00' || dist === '98') dist = 'At Large';
+        const dist = extractDistrictNumber(cdObj);
 
         const senators = state.data.legislators.filter(l => l.state === stCode && l.chamber === 'Senate' && l.caucusStatus !== 'Former / 119th');
         const rep = state.data.legislators.find(l => l.state === stCode && l.chamber === 'House' && String(l.district) === String(dist) && l.caucusStatus !== 'Former / 119th');
         state.addressResult = { matchedAddress: best.matchedAddress || q, state: stCode, district: dist, senators, rep: rep || null };
-        if (stCode) state.legStateFilter = stCode;
       } catch (err) {
         state.addressError = 'Error parsing congressional district response: ' + err.message;
       }
