@@ -1,10 +1,13 @@
-// Constituent Address Lookup & Filter Patch for 119th Congress Taiwan Bills Tracker
+// Constituent Address Lookup, Live Google Sheets Sync & Filter Patch for Congress Taiwan Bills Tracker
 window.addEventListener('DOMContentLoaded', function() {
   if (typeof state === 'undefined') return;
   state.addressInput = state.addressInput || '';
   state.addressLoading = false;
   state.addressError = '';
   state.addressResult = null;
+
+  const BILLS_SHEET_ID = '1fxEmsfhBS5tEw65fGWxi2-iz7O41Vj8AsNjC4SU1OAM';
+  const TRACKER_SHEET_ID = '1mdaAJWzUlD_beW-wg3Ag0_bNQaTie77te79jf11zzY4';
 
   const FIPS_TO_STATE = {
     '01':'AL','02':'AK','04':'AZ','05':'AR','06':'CA','08':'CO','09':'CT','10':'DE','11':'DC','12':'FL',
@@ -13,6 +16,342 @@ window.addEventListener('DOMContentLoaded', function() {
     '34':'NJ','35':'NM','36':'NY','37':'NC','38':'ND','39':'OH','40':'OK','41':'OR','42':'PA','44':'RI',
     '45':'SC','46':'SD','47':'TN','48':'TX','49':'UT','50':'VT','51':'VA','53':'WA','54':'WV','55':'WI',
     '56':'WY','60':'AS','66':'GU','69':'MP','72':'PR','78':'VI'
+  };
+
+  function normDist(d) {
+    if (!d) return null;
+    const s = String(d).trim();
+    if (!s || s === 'N/A' || s === 'Senate') return null;
+    if (/At Large|^0$/i.test(s)) return 'At Large';
+    return s.replace(/^0+/, '');
+  }
+
+  function parseMember(str) {
+    if (!str || !str.trim()) return null;
+    const s = str.trim();
+    const role = s.startsWith('Sen.') ? 'Sen.' : (s.startsWith('Del.') ? 'Del.' : 'Rep.');
+    const chamber = role === 'Sen.' ? 'Senate' : 'House';
+    const m = s.match(/\[([A-Z])-([A-Z]{2})(?:-([^\]]+))?\]/);
+    const party = m ? m[1] : 'U';
+    const state = m ? m[2] : '';
+    const district = normDist(m && m[3] ? m[3] : null);
+    const namePart = s.replace(/^(Sen\.|Rep\.|Del\.)\s*/, '').split(/\[|\(/)[0].trim();
+    const lastName = (namePart.split(',')[0] || '').trim().toLowerCase();
+    const id = (chamber === 'House' && district ? `house|${state}|${district}|${lastName}` : `${chamber}|${state}|${lastName}`).toLowerCase();
+    return { id, raw: s, role, chamber, name: namePart, displayName: `${role} ${namePart}`, party, state, district };
+  }
+
+  function parseCosponsors(str) {
+    if (!str || !str.trim()) return [];
+    const parts = str.trim().split(/,\s*(?=(?:Sen\.|Rep\.|Del\.)\s)/);
+    const seen = new Set();
+    const out = [];
+    for (const p of parts) {
+      const m = parseMember(p);
+      if (m && !seen.has(m.id)) {
+        seen.add(m.id);
+        out.push(m);
+      }
+    }
+    return out;
+  }
+
+  function classifyStage(a) {
+    const s = String(a || '');
+    if (/Became Public Law/i.test(s)) return { key: 'enacted', label: 'Enacted (Public Law)', step: 4 };
+    if (/Received in the Senate|Received in the House|Held at the desk|Passed Senate|Passed House/i.test(s)) return { key: 'passed_chamber', label: 'Passed 1st Chamber / Desk', step: 3 };
+    if (/Placed on Senate Legislative Calendar|Ordered to be Reported|Calendar No\./i.test(s)) return { key: 'calendar', label: 'Committee Reported / Calendar', step: 2 };
+    return { key: 'committee', label: 'In Committee', step: 1 };
+  }
+
+  function classifyTheme(title, summary) {
+    const t = `${title} ${summary}`.toLowerCase();
+    if (/space|undersea|cyber|innovation|uncrewed|energy|lng|nuclear/.test(t)) return 'Energy, Space & Tech Resilience';
+    if (/tax|internal revenue|imf|monetary|financial|conflict deterrence|regulatory|treasury|embargo/.test(t)) return 'Economic, Tax & Financial Deterrence';
+    if (/porcupine|defense|ndaa|armed services|arms export|munitions|deter prc|sos act|plus act/.test(t)) return 'Defense & Military Deterrence';
+    if (/2758|representative office|allies fund|solidarity|holy see|vatican|americas|blue skies|travel and tourism|flag|assurance|six assurances|reinforcement/.test(t)) return 'Diplomatic & International Space';
+    return 'Democracy & Bilateral Relations';
+  }
+
+  function rebuildLiveDataset(liveBillsRows, liveTrackerCompact) {
+    const baseData = window.TAIWAN_BILLS_DATA || state.data;
+    let bills = baseData ? baseData.bills.map(b => ({ ...b })) : [];
+
+    if (liveBillsRows && liveBillsRows.length > 1) {
+      const rawBills = liveBillsRows.slice(1).filter(r => r && r[0] && String(r[0]).trim());
+      bills = rawBills.map((r, idx) => {
+        const billNumber = String(r[0] || '').trim();
+        const shortNumber = billNumber.replace(/^\[119th\]\s*/i, '').trim();
+        const title = String(r[1] || '').trim();
+        const summary = String(r[2] || '').trim();
+        const latestAction = String(r[3] || '').trim();
+        const latestActionDate = String(r[4] || '').trim();
+        const sponsor = parseMember(String(r[5] || ''));
+        const cosponsorCount = parseInt(r[6] || '0', 10) || 0;
+        const cosponsors = parseCosponsors(String(r[7] || ''));
+        const dateIntroduced = String(r[8] || '').trim();
+        const daysPending = parseInt(r[9] || '0', 10) || 0;
+        let link = String(r[10] || '').trim();
+        const chamber = shortNumber.startsWith('S.') ? 'Senate' : 'House';
+        const numDigits = (shortNumber.match(/\d+/) || [])[0];
+        if (numDigits) {
+          if (shortNumber.startsWith('S.Res.') && link.includes('/senate-bill/')) link = `https://www.congress.gov/bill/119th-congress/senate-resolution/${numDigits}`;
+          if (shortNumber.startsWith('H.Res.') && link.includes('/senate-bill/')) link = `https://www.congress.gov/bill/119th-congress/house-resolution/${numDigits}`;
+          if (shortNumber.startsWith('H.Con.Res.') && link.includes('/senate-bill/')) link = `https://www.congress.gov/bill/119th-congress/house-concurrent-resolution/${numDigits}`;
+        }
+        const rCosponsors = cosponsors.filter(c => c.party === 'R').length;
+        const dCosponsors = cosponsors.filter(c => c.party === 'D').length;
+        const totalR = rCosponsors + (sponsor && sponsor.party === 'R' ? 1 : 0);
+        const totalD = dCosponsors + (sponsor && sponsor.party === 'D' ? 1 : 0);
+        return {
+          id: shortNumber, rowNumber: idx + 2, billNumber, shortNumber, chamber, title,
+          cleanTitle: title.replace(/\s*\((?:House|Senate)\s+Companion\)\s*$/i, '').trim(),
+          summary, latestAction, latestActionDate, sponsor, cosponsorCount, cosponsors,
+          totalR, totalD, bipartisan: totalR > 0 && totalD > 0, dateIntroduced, daysPending, link,
+          stage: classifyStage(latestAction), theme: classifyTheme(title, summary), companionBill: null
+        };
+      });
+
+      const byShort = {};
+      bills.forEach(b => { byShort[b.shortNumber.toUpperCase()] = b; });
+      bills.forEach(b => {
+        const m = b.summary.match(/companion to ((?:S\.|H\.R\.|S\.Res\.|H\.Res\.)\s*\d+)/i);
+        if (m) {
+          const key = m[1].replace(/\s+/g, ' ').trim().toUpperCase();
+          if (byShort[key]) { b.companionBill = byShort[key].shortNumber; byShort[key].companionBill = b.shortNumber; }
+        }
+      });
+      [['H.R. 33','S. 199'],['S.Res. 86','H.Res. 148'],['S. 821','H.R. 1512'],['H.R. 5626','S. 3979'],['H.Res. 1278','S.Res. 754'],['H.Res. 1366','S.Res. 657']].forEach(([a, c]) => {
+        const ba = byShort[a.toUpperCase()], bc = byShort[c.toUpperCase()];
+        if (ba && bc) { ba.companionBill = ba.companionBill || bc.shortNumber; bc.companionBill = bc.companionBill || ba.shortNumber; }
+      });
+      bills.forEach(b => {
+        if (b.companionBill) return;
+        const match = bills.find(o => o.shortNumber !== b.shortNumber && o.chamber !== b.chamber && o.cleanTitle.toLowerCase() === b.cleanTitle.toLowerCase());
+        if (match) { b.companionBill = match.shortNumber; match.companionBill = match.companionBill || b.shortNumber; }
+      });
+    }
+
+    const legMap = {};
+    if (liveTrackerCompact && liveTrackerCompact.length >= 100) {
+      liveTrackerCompact.forEach(tr => {
+        const fullName = tr[0];
+        const chamber = tr[1] === 'S' ? 'Senate' : 'House';
+        const party = tr[2];
+        const stateCode = tr[3];
+        const district = normDist(tr[4]);
+        const caucusStatus = tr[5] || 'No';
+        const grade = tr[6] || '';
+        const role = chamber === 'Senate' ? 'Sen.' : (['GU','AS','DC','VI','MP','PR'].includes(stateCode) ? 'Del.' : 'Rep.');
+        const lastGuess = (fullName.split(/\s+/).pop() || '').toLowerCase();
+        const id = (chamber === 'House' && district ? `house|${stateCode}|${district}|${lastGuess}` : `${chamber}|${stateCode}|${lastGuess}`).toLowerCase();
+        legMap[id] = {
+          id, name: fullName, displayName: `${role} ${fullName}`, role, chamber, party, state: stateCode, district,
+          caucusStatus, grade, sponsoredBills: [], cosponsoredBills: []
+        };
+      });
+    } else if (baseData && baseData.legislators) {
+      baseData.legislators.forEach(l => {
+        if (l.caucusStatus !== 'Former / 119th') {
+          legMap[l.id] = { ...l, sponsoredBills: [], cosponsoredBills: [] };
+        }
+      });
+    }
+
+    function findOrCreateLeg(member) {
+      if (!member) return null;
+      if (legMap[member.id]) return legMap[member.id];
+      const lastPart = (member.name.split(',')[0] || '').trim().toLowerCase();
+      const firstPart = ((member.name.split(',')[1] || '').trim().split(/\s+/)[0] || '').toLowerCase();
+      const all = Object.values(legMap);
+      let found = all.find(l => l.state === member.state && l.chamber === member.chamber && l.name.toLowerCase().includes(lastPart));
+      if (found) return found;
+      if (member.chamber === 'House' && member.district) {
+        found = all.find(l => l.state === member.state && l.chamber === 'House' && l.district === member.district && (l.name.toLowerCase().includes(lastPart) || (firstPart && l.name.toLowerCase().includes(firstPart))));
+        if (found) return found;
+      }
+      if (lastPart === 'curtis' && member.state === 'UT') {
+        found = all.find(l => l.state === 'UT' && l.name.toLowerCase().includes('curtis'));
+        if (found) return found;
+      }
+      const cleanFull = member.name.includes(',') ? member.name.split(',').reverse().map(s => s.trim()).join(' ') : member.name;
+      legMap[member.id] = {
+        id: member.id, name: cleanFull, displayName: `${member.role} ${cleanFull}`, role: member.role,
+        chamber: member.chamber, party: member.party, state: member.state, district: member.district,
+        caucusStatus: 'Former / 119th', grade: 'N/A', sponsoredBills: [], cosponsoredBills: []
+      };
+      return legMap[member.id];
+    }
+
+    bills.forEach(b => {
+      if (b.sponsor) {
+        const leg = findOrCreateLeg(b.sponsor);
+        if (leg) {
+          b.sponsor.id = leg.id; b.sponsor.displayName = leg.displayName;
+          if (!leg.sponsoredBills.includes(b.shortNumber)) leg.sponsoredBills.push(b.shortNumber);
+        }
+      }
+      b.cosponsors.forEach(c => {
+        const leg = findOrCreateLeg(c);
+        if (leg) {
+          c.id = leg.id; c.displayName = leg.displayName;
+          if (!leg.sponsoredBills.includes(b.shortNumber) && !leg.cosponsoredBills.includes(b.shortNumber)) leg.cosponsoredBills.push(b.shortNumber);
+        }
+      });
+    });
+
+    const legislators = Object.values(legMap).map(l => ({
+      ...l,
+      sponsoredCount: l.sponsoredBills.length,
+      cosponsoredCount: l.cosponsoredBills.length,
+      totalInvolvement: l.sponsoredBills.length + l.cosponsoredBills.length
+    })).sort((a, b) => b.totalInvolvement - a.totalInvolvement || b.sponsoredCount - a.sponsoredCount || a.state.localeCompare(b.state) || a.name.localeCompare(b.name));
+
+    return {
+      spreadsheetId: BILLS_SHEET_ID,
+      spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${BILLS_SHEET_ID}/edit`,
+      totalBills: bills.length,
+      enactedCount: bills.filter(b => b.stage.key === 'enacted').length,
+      bipartisanCount: bills.filter(b => b.bipartisan).length,
+      companionPairsCount: Math.floor(bills.filter(b => b.companionBill).length / 2),
+      totalLegislators: legislators.length,
+      activeLegislatorsCount: legislators.filter(l => l.totalInvolvement > 0).length,
+      bills,
+      legislators
+    };
+  }
+
+  function fetchGvizSheet(spreadsheetId, sheetName) {
+    return new Promise((resolve, reject) => {
+      const cbName = '__gvizCb_' + Date.now() + '_' + Math.floor(Math.random() * 100000);
+      const script = document.createElement('script');
+      const timer = setTimeout(() => {
+        if (window[cbName]) {
+          delete window[cbName];
+          if (script.parentNode) script.parentNode.removeChild(script);
+          reject(new Error('Google Sheet request timed out.'));
+        }
+      }, 9000);
+
+      window[cbName] = function(resp) {
+        clearTimeout(timer);
+        delete window[cbName];
+        if (script.parentNode) script.parentNode.removeChild(script);
+        if (!resp || resp.status === 'error' || !resp.table) {
+          reject(new Error('Sheet not publicly readable yet'));
+          return;
+        }
+        const cols = (resp.table.cols || []).map(c => c.label || '');
+        const rows = (resp.table.rows || []).map(r =>
+          (r.c || []).map(cell => {
+            if (!cell) return '';
+            if (cell.f !== undefined && cell.f !== null) return String(cell.f);
+            if (cell.v !== undefined && cell.v !== null) return String(cell.v);
+            return '';
+          })
+        );
+        if (cols.some(Boolean)) {
+          resolve([cols, ...rows]);
+        } else {
+          resolve(rows);
+        }
+      };
+
+      script.onerror = function() {
+        clearTimeout(timer);
+        delete window[cbName];
+        if (script.parentNode) script.parentNode.removeChild(script);
+        reject(new Error('Sheet requires "Anyone with the link can view" sharing permission'));
+      };
+
+      const tqx = `responseHandler:${cbName}`;
+      const sheetParam = sheetName ? `&sheet=${encodeURIComponent(sheetName)}` : '';
+      script.src = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/gviz/tq?tqx=${encodeURIComponent(tqx)}${sheetParam}`;
+      document.body.appendChild(script);
+    });
+  }
+
+  function convertTrackerGvizToCompact(rows) {
+    const out = [];
+    rows.forEach(r => {
+      const name = String(r[0] || '').trim();
+      if (!name || /^name$/i.test(name)) return;
+      const chRaw = String(r[1] || '').trim();
+      const ch = /^s/i.test(chRaw) ? 'S' : 'H';
+      const pRaw = String(r[2] || '').trim();
+      const pty = /^r/i.test(pRaw) ? 'R' : (/^d/i.test(pRaw) ? 'D' : 'I');
+      const st = String(r[3] || '').trim();
+      const distRaw = String(r[4] || '').trim();
+      const dist = (!distRaw || /^n\/a$/i.test(distRaw)) ? '' : (/at\s*large|^0$/i.test(distRaw) ? '0' : distRaw.replace(/\.0$/, ''));
+      const caucusRaw = String(r[10] || '').trim();
+      const caucus = (!caucusRaw || /^no$/i.test(caucusRaw)) ? '' : caucusRaw;
+      const grade = String(r[13] || '').trim();
+      if (st.length === 2) {
+        out.push([name, ch, pty, st, dist, caucus, grade]);
+      }
+    });
+    return out;
+  }
+
+  window.syncFromGoogleSheet = async function(silent) {
+    if (state.syncing) return;
+    state.syncing = true;
+    if (!silent) {
+      state.syncStatusMsg = '⟳ Connecting to Google Sheets (Bills & 539-Member Roster)...';
+      render();
+    }
+
+    if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
+      try {
+        const res = await fetch('/api/sync', { method: 'POST' });
+        if (res.ok) {
+          const fresh = await res.json();
+          state.data = fresh;
+          state.syncStatusMsg = `✓ Live synced ${fresh.totalBills} bills & ${fresh.totalLegislators} lawmakers via local CLI (${fresh.lastSyncedAt})`;
+          state.syncing = false;
+          render();
+          return;
+        }
+      } catch (_) {}
+    }
+
+    try {
+      const [billsResult, trackerResult] = await Promise.allSettled([
+        fetchGvizSheet(BILLS_SHEET_ID, 'Sheet1'),
+        fetchGvizSheet(TRACKER_SHEET_ID, 'Tracker')
+      ]);
+
+      const liveBillsRows = billsResult.status === 'fulfilled' && billsResult.value && billsResult.value.length > 1
+        ? billsResult.value
+        : null;
+      const liveTrackerCompact = trackerResult.status === 'fulfilled' && trackerResult.value
+        ? convertTrackerGvizToCompact(trackerResult.value)
+        : null;
+
+      if (!liveBillsRows && (!liveTrackerCompact || liveTrackerCompact.length < 100)) {
+        if (!silent) {
+          state.syncStatusMsg = 'ℹ️ To enable live browser sync on GitHub Pages, set your Google Sheet sharing to "Anyone with the link can view" (File → Share → Share with others). Currently showing embedded snapshot (49 bills · 543 lawmakers).';
+        }
+        state.syncing = false;
+        render();
+        return;
+      }
+
+      const freshData = rebuildLiveDataset(liveBillsRows, liveTrackerCompact);
+      state.data = freshData;
+      const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const syncedParts = [];
+      if (liveBillsRows) syncedParts.push(`${freshData.totalBills} bills`);
+      if (liveTrackerCompact && liveTrackerCompact.length >= 100) syncedParts.push(`${freshData.totalLegislators} lawmakers`);
+      state.syncStatusMsg = `✓ Live synced from Google Sheets (${syncedParts.join(' & ')}) at ${nowStr}`;
+    } catch (err) {
+      if (!silent) {
+        state.syncStatusMsg = 'ℹ️ Share your Google Sheet as "Anyone with the link can view" to enable live GitHub Pages sync. Showing current snapshot (49 bills · 543 lawmakers).';
+      }
+    } finally {
+      state.syncing = false;
+      render();
+    }
   };
 
   function extractDistrictNumber(cdObj) {
@@ -230,4 +569,5 @@ window.addEventListener('DOMContentLoaded', function() {
   };
 
   if (typeof render === 'function') render();
+  window.syncFromGoogleSheet(true);
 });
