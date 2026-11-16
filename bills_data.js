@@ -1,10 +1,11 @@
-// Constituent Address Lookup, Live Google Sheets Sync & Dynamic Congress Auto-Updater for Congress Taiwan Bills Tracker
+// Constituent Address Lookup, Silent Auto-Sync & Dynamic Congress Updater for Congress Taiwan Bills Tracker
 window.addEventListener('DOMContentLoaded', function() {
   if (typeof state === 'undefined') return;
   state.addressInput = state.addressInput || '';
   state.addressLoading = false;
   state.addressError = '';
   state.addressResult = null;
+  state.syncStatusMsg = '';
 
   const BILLS_SHEET_ID = '1fxEmsfhBS5tEw65fGWxi2-iz7O41Vj8AsNjC4SU1OAM';
   const TRACKER_SHEET_ID = '1mdaAJWzUlD_beW-wg3Ag0_bNQaTie77te79jf11zzY4';
@@ -317,7 +318,7 @@ window.addEventListener('DOMContentLoaded', function() {
         clearTimeout(timer);
         delete window[cbName];
         if (script.parentNode) script.parentNode.removeChild(script);
-        reject(new Error('Sheet requires "Anyone with the link can view" sharing permission'));
+        reject(new Error('Sheet not publicly readable'));
       };
 
       const tqx = `responseHandler:${cbName}`;
@@ -349,13 +350,11 @@ window.addEventListener('DOMContentLoaded', function() {
     return out;
   }
 
-  window.syncFromGoogleSheet = async function(silent) {
+  // Silent background auto-sync (runs on page load, tab focus, and every 5 minutes)
+  window.syncFromGoogleSheet = async function() {
     if (state.syncing) return;
     state.syncing = true;
-    if (!silent) {
-      state.syncStatusMsg = '⟳ Connecting to Google Sheets (Bills & 539-Member Roster)...';
-      render();
-    }
+    state.syncStatusMsg = '';
 
     if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
       try {
@@ -364,7 +363,6 @@ window.addEventListener('DOMContentLoaded', function() {
           const fresh = await res.json();
           const meta = detectCongressMetadata(fresh.bills);
           state.data = { ...fresh, ...meta };
-          state.syncStatusMsg = `✓ Live synced ${fresh.totalBills} bills & ${fresh.totalLegislators} lawmakers via local CLI (${fresh.lastSyncedAt})`;
           state.syncing = false;
           render();
           return;
@@ -385,28 +383,13 @@ window.addEventListener('DOMContentLoaded', function() {
         ? convertTrackerGvizToCompact(trackerResult.value)
         : null;
 
-      if (!liveBillsRows && (!liveTrackerCompact || liveTrackerCompact.length < 100)) {
-        if (!silent) {
-          state.syncStatusMsg = 'ℹ️ To enable live browser sync on GitHub Pages, set your Google Sheet sharing to "Anyone with the link can view" (File → Share → Share with others).';
-        }
-        state.syncing = false;
-        render();
-        return;
+      if (liveBillsRows || (liveTrackerCompact && liveTrackerCompact.length >= 100)) {
+        state.data = rebuildLiveDataset(liveBillsRows, liveTrackerCompact);
       }
-
-      const freshData = rebuildLiveDataset(liveBillsRows, liveTrackerCompact);
-      state.data = freshData;
-      const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      const syncedParts = [];
-      if (liveBillsRows) syncedParts.push(`${freshData.totalBills} bills`);
-      if (liveTrackerCompact && liveTrackerCompact.length >= 100) syncedParts.push(`${freshData.totalLegislators} lawmakers`);
-      state.syncStatusMsg = `✓ Live synced from Google Sheets (${freshData.congressOrd} Congress: ${syncedParts.join(' & ')}) at ${nowStr}`;
-    } catch (err) {
-      if (!silent) {
-        state.syncStatusMsg = 'ℹ️ Share your Google Sheet as "Anyone with the link can view" to enable live GitHub Pages sync.';
-      }
+    } catch (_) {
     } finally {
       state.syncing = false;
+      state.syncStatusMsg = '';
       render();
     }
   };
@@ -626,12 +609,34 @@ window.addEventListener('DOMContentLoaded', function() {
     const enactedSub = state.data.enactedSubtitle || meta.enactedSubtitle;
     document.title = `${ord} Congress Taiwan Bills Tracker`;
     return htmlStr
+      // Update badge & remove Google Sheet references/buttons from the header
+      .replace(/Live Google Sheet Backend/g, 'Live Legislative Tracker')
+      .replace(/Powered directly by your\s*<a[^>]*>Congress Taiwan Bills Google Sheet ↗<\/a>\s*— preserving your automated Congress\.gov API updates\./g, 'Real-time legislative tracking, bicameral companion bill analysis, and constituent lawmaker lookup across the U.S. Senate and House of Representatives.')
+      .replace(/<button\s+onclick="syncFromGoogleSheet\(\)"[\s\S]*?<\/button>/g, '')
+      .replace(/<a\s+href="[^"]*"\s+target="_blank"\s+rel="noopener"\s+class="[^"]*"\s*>\s*Open Google Sheet ↗\s*<\/a>/g, '')
+      .replace(/Sort: Google Sheet Row Order/g, 'Sort: Default Tracker Order')
+      // Update Congress session labels & enacted laws dynamically
       .replace(/119th U\.S\. Congress \(2025–2026\)/g, banner)
       .replace(/PL 119-60 \(S\.1071\) &amp; PL 119-45 \(H\.R\.1512\)|PL 119-60 \(S\.1071\) & PL 119-45 \(H\.R\.1512\)/g, enactedSub)
       .replace(/119th Bills/g, `${ord} Bills`)
       .replace(/Supported Bills \(119th Congress\)/g, `Supported Bills (${ord} Congress)`)
       .replace(/0 bills in 119th Congress/g, `0 bills in ${ord} Congress`)
       .replace(/across all 49 Taiwan bills/g, `across all ${state.data.totalBills} Taiwan bills`);
+  }
+
+  // Also clean up Google Sheet references inside the Bill Detail modal
+  const origOpenBillModal = window.openBillModal;
+  if (typeof origOpenBillModal === 'function') {
+    window.openBillModal = function(shortNum) {
+      origOpenBillModal(shortNum);
+      const content = document.getElementById('modal-content');
+      if (content) {
+        content.innerHTML = content.innerHTML
+          .replace(/No cosponsors recorded yet in Google Sheet\./g, 'No cosponsors recorded yet.')
+          .replace(/Google Sheet Row #\d+\s*·\s*Formula Days Pending:/g, 'Days Pending:')
+          .replace(/<a[^>]*>\s*Open Row in Google Sheet ↗\s*<\/a>/g, '');
+      }
+    };
   }
 
   const origRenderLegRows = window.renderLegislatorRows;
@@ -651,6 +656,7 @@ window.addEventListener('DOMContentLoaded', function() {
   const origRender = window.render;
   if (typeof origRender === 'function') {
     window.render = function() {
+      state.syncStatusMsg = '';
       origRender();
       const app = document.getElementById('app');
       if (app) {
@@ -660,5 +666,11 @@ window.addEventListener('DOMContentLoaded', function() {
   }
 
   if (typeof window.render === 'function') window.render();
-  window.syncFromGoogleSheet(true);
+
+  // Automatically sync in the background on load, every 5 minutes, and when tab regains focus
+  window.syncFromGoogleSheet();
+  setInterval(() => window.syncFromGoogleSheet(), 5 * 60 * 1000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') window.syncFromGoogleSheet();
+  });
 });
